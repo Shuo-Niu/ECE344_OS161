@@ -1,0 +1,186 @@
+//#include <types.h>
+//#include <kern/errno.h>
+//#include <lib.h>
+//#include <thread.h>
+//#include <curthread.h>
+//#include <addrspace.h>
+//#include <vm.h>
+//
+//#include <vnode.h>
+//#include <uio.h>
+//
+//#include <machine/spl.h>
+//#include <machine/tlb.h>
+//
+//#include <machine/vm.h>
+
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+
+int frame_count;
+int paddr_start;
+
+//initialization function
+void vm_bootstrap(void) {
+    u_int32_t low, high;
+    ram_getsize(&low, &high);
+
+    // each frame has size of PAGE_SIZE
+    // but also for each frame we lose the space for "frame" itself
+    frame_count = (high-low) / (PAGE_SIZE + sizeof(struct frame));
+
+    int core_map_size = frame_count * sizeof(struct frame);
+
+    // number of pages required to store core_map
+    core_map_size - (int) ((core_map_size - 1) / PAGE_SIZE ) + 1;
+
+    paddr_start = low + core_map_size;
+
+    // make core_map poin to the beginning of the available physical address
+    core_map = PADDR_TO_KVADDR(low);
+
+
+
+    int i;
+    for (i=0; i < frame_count; i++) {
+        core_map[i].valid = 0;
+        core_map[i].pages = NULL;
+    }
+}
+
+// Based on dumbvm/vm_fault()
+int vm_fault(int faulttype, vaddr_t faultaddress) {
+
+    vaddr_t vbase, vtop;
+    struct addrspace *as;
+    int spl;
+
+    paddr_t paddr;
+    int i;
+    u_int32_t ehi, elo;
+
+    spl = splhigh();
+
+    DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+
+    as = curthread->t_vmspace;
+    if (as == NULL) {
+        /*
+         * No address space set up. This is probably a kernel
+         * fault early in boot. Return EFAULT so as to panic
+         * instead of getting into an infinite faulting loop.
+         */
+        return EFAULT;
+    }
+
+    region = as->region;
+    int reg_exist = 0; // checking if there exists region which contains the faultaddress
+
+    // traverse through regions to find the one where faultaddress is located
+    while (region != NULL) {
+        vbase = region->vbase;
+
+        // stack region
+        if (region->in_stack == 1) {
+            // stack grows downwards
+            vtop = vbase - (region->npages)*PAGE_SZE;
+            if (faultaddress <= vbase && faultaddress >= vtop) {
+                reg_exist = 1;
+                break;
+            }
+        }
+
+        // not stack region
+        else {
+            vtop = vbase + (region->npages)*PAGE_SZE;
+            if (faultaddress >= vbase && faultaddress <= vtop) {
+                reg_exist = 1;
+                break;
+            }
+        }
+
+        region = region->region;
+    }
+
+    if (reg_exist == 0) {
+        splx(spl);
+        return EFAULT;
+    }
+
+
+    vaddr_t first, second;
+    faultaddress >> 12;             // get rid of the offset
+    second = faultaddress & 0x3ff;  // take only last ten bits
+    first = faultaddress >> 10;     // take only first ten bits
+
+    struct secondpte *secondary_page;   // pointer to secondary page containing the mapping of the faultaddress
+
+    switch(faulttype) {
+
+        case VM_FAULT_READONLY:
+            /* We always create pages read-write, so we can't get this */
+            panic("Got VM_FAULT_READONLY\n");
+            break;
+
+        case VM_FAULT_READ:
+            if (region->readable == 0) {
+                splx(spl);
+                return EINVAL;
+            }
+
+            if (as->first_pte[first].second_pte == NULL) {
+                as->first_pte[first].second_pte = create_second_pte();
+            }
+
+            secondary_page = &(as->first_pte[first].second_pte[second]);
+
+            if (secondary_page.valid == 0) {
+                for (i=0; i < frame_count; i++) {
+                    if (core_map[i].valid == 0) {
+                        core_map[i].valid = 1;
+                        paddr = paddr_start + i*PAGE_SIZE;
+                        break;
+                    }
+                }
+                frame = paddr >> 12;    // get rid of the offset
+                secondary_page->frame = frame;
+                secondary_page->valid = 1;
+            }
+            else {
+
+            }
+
+            break;
+
+        case VM_FAULT_WRITE:
+            if (region->writable == 0) {
+                splx(spl);
+                return EINVAL;
+            }
+    }
+
+
+
+    for (i=0; i<NUM_TLB; i++) {
+        TLB_Read(&ehi, &elo, i);
+        if (elo & TLBLO_VALID) {
+            continue;
+        }
+        ehi = faultaddress;
+        elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+        DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+        TLB_Random(ehi, elo, i);
+        splx(spl);
+        return 0;
+    }
+    TLB_Random(ehi,elo);
+    return 0;
+
+}

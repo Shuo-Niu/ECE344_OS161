@@ -1,0 +1,515 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <curthread.h>
+#include <thread.h>
+#include <synch.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <clock.h>
+
+#include <kern/unistd.h>
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+// int sleep = 0;
+// int currentpid = -1;
+
+void
+mips_syscall(struct trapframe *tf)  // delegate the actual work of a system call to the kernel function that implements it
+{
+	int callno;
+	int32_t retval;
+	int err;
+
+	assert(curspl==0);
+
+	callno = tf->tf_v0;  // the system call number is passed in the v0 register
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values,
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+    case SYS_reboot:  // SYS_reboot == 8 (kern/include/kern/callno.h)
+      err = sys_reboot(tf->tf_a0);
+      break;
+
+	    /* Add stuff here */
+    case SYS_write:
+      err = sys_write(tf->tf_a0, (void*)tf->tf_a1, tf->tf_a2, &retval);
+      break;
+
+    case SYS_read:
+      err = sys_read(tf->tf_a0, (void*)tf->tf_a1, tf->tf_a2, &retval);
+      break;
+
+    case SYS_fork:
+      err = sys_fork(tf,&retval);
+      break;
+
+    case SYS_getpid:
+      err = sys_getpid(&retval);
+      break;
+
+    case SYS_waitpid:
+      err = sys_waitpid(tf->tf_a0, (void*)tf->tf_a1, tf->tf_a2, &retval);
+      break;
+
+    case SYS__exit:
+      err = sys__exit(tf->tf_a0);
+      break;
+
+    case SYS_execv:
+      err = sys_execv((char*)tf->tf_a0, (char**)tf->tf_a1, &retval);
+      break;
+
+    case SYS___time:
+      err = sys___time((userptr_t)tf->tf_a0,(userptr_t)tf->tf_a1, &retval);
+      break;
+
+    case SYS_sbrk:
+      err = sys_sbrk((intptr_t)tf->tf_a0,&retval);
+      break;
+
+    default:
+      kprintf("Unknown syscall %d\n", callno);
+      err = ENOSYS;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+//        kprintf("Error occurred: %d\n", err);
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+
+	tf->tf_epc += 4;
+
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(void *data1, unsigned long data2)  // a stub, where placing code to implement fork()
+{
+	/*
+	 * This function is provided as a reminder. You need to write
+	 * both it and the code that calls it.
+	 *
+	 * Thus, you can trash it and do things another way if you prefer.
+	 */
+
+    // copy trapframe
+    struct trapframe tf;
+    memcpy(&tf,(struct trapframe*)data1,sizeof(struct trapframe));
+    kfree(data1);
+
+    // assign address space
+    curthread->t_vmspace = (struct addrspace*)data2;
+    as_activate(curthread->t_vmspace);
+
+    tf.tf_v0 = 0;
+    tf.tf_a3 = 0;
+    tf.tf_epc += 4;
+
+    mips_usermode(&tf);
+
+	//(void)tf;
+}
+
+int sys_write(int fd, const void *buf, size_t nbytes, int *retval){
+
+    if (fd != STDOUT_FILENO && fd != STDERR_FILENO){
+        *retval = -1;   // return -1: error
+        return EBADF;   // error: invalid file descriptor
+    }
+
+    if (buf == NULL){
+        *retval = -1;   // return -1: error
+        return EFAULT;  // error: invalid address space pointed to by buf
+    }
+
+    int spl = splhigh();  // ADD FOR ASST3
+
+    char* temp = kmalloc((nbytes+1)*sizeof(char));
+    int status = copyin((const userptr_t)buf, (void*)temp, nbytes+1);
+
+    if (status != 0) {
+        kfree(temp);
+        *retval = -1;   // return -1: error
+        splx(spl);  // ADD FOR ASST3
+        return EFAULT;  // error: invalid address space pointed to by buf
+
+    } else {
+        temp[nbytes] = '\0';
+        kprintf("%s", temp);
+        kfree(temp);
+        *retval = nbytes;   // successful, return the count of bytes written
+        splx(spl);  // ADD FOR ASST3
+        return 0;   // no error
+    }
+}
+
+int sys_read(int fd, void *buf, size_t buflen, int* retval){
+
+    if (fd != STDIN_FILENO) {
+        *retval = -1;   // return -1: error
+        return EBADF;   // error: invalid file descriptor
+    }
+
+	if(buf == NULL){
+        *retval = -1;   // return -1: error
+        return EFAULT;  // error: invalid address space pointed to by buf
+	}
+
+	char* temp = kmalloc((buflen+1)*sizeof(char));
+
+	int count = 0;
+	int i;
+	for(i=0;i<(int)buflen;i++){
+		temp[i]=getch();
+		count++;
+		if(temp[i]=='\r')
+			break;
+	}
+	temp[count] = '\0';
+
+	int status = copyout((const void*)temp, (userptr_t)buf, count+1);
+
+	if(status != 0){
+        kfree(temp);
+        *retval = -1;   // return -1: error
+        return EFAULT;  // error: invalid address space pointed to by buf
+	} else {
+        kfree(temp);
+        *retval = count;    // successful, return the count of bytes read
+        return 0;   // no error
+	}
+}
+
+int sys_fork(struct trapframe *tf, int *retval){
+    int spl = splhigh();
+
+    struct thread* child_thread;
+    struct addrspace* new_space;
+    struct trapframe* copy_tf = kmalloc(sizeof(struct trapframe));
+
+    if(copy_tf == NULL){
+        splx(spl);
+        return ENOMEM;  // error: no sufficient available virtual memory
+    }
+
+    // copy memory on trapframe tf to copy_tf
+    memcpy(copy_tf,tf, sizeof(struct trapframe));
+
+    // copy memory on current address space to new_space
+    int status = as_copy(curthread->t_vmspace,&new_space);
+    if(status != 0){
+        kfree(copy_tf);
+        splx(spl);
+        return ENOMEM;  // error: no sufficient available virtual memory
+    }
+
+    int fork_status = thread_fork(curthread->t_name,copy_tf,(unsigned long)new_space,md_forkentry,&child_thread);
+    if(fork_status != 0){
+        kfree(copy_tf);
+        splx(spl);
+        return ENOMEM;  // error: no sufficient available virtual memory
+    }
+
+    *retval = child_thread->pid;
+    splx(spl);
+    return 0;
+}
+
+int sys_getpid(int *retval){
+    *retval = curthread->pid;
+    return 0;
+}
+
+int sys_waitpid(int pid, int *status, int options, int* retval) {
+
+    // We prevent other threads from disturbing the operation
+    // The lock is released right before return - in case of failure
+    // or before starting actual waiting - in case of success
+
+    if (pid == -8 || pid == -1 || pid == 0 || pid == 34000) {
+        *retval = -1;
+        return EINVAL;
+    }
+    // (void *)0x80000000 is a provided addr within kernel
+    // (void *)0x40000000 is a provided addr not part of program
+    if (status == NULL || (void*)status == (void*)0x40000000 || (void*)status == (void*)0x80000000) {
+        *retval = -1;
+        return EFAULT;
+    }
+    if (options != 0) {
+        *retval = -1;   // return -1: error
+        return EINVAL;
+    }
+    if (pid == curthread->pid) {
+        *retval = -1;
+        return EINVAL;
+    }
+
+    P(lock);
+
+    // The options argument should be 0
+
+    struct thread* pid_thread;
+    int has_exited = get_exited(pid);   // check if pid thread has already exited (1 if yes, 0 if not)
+
+    *retval = pid;          // return pid
+
+    // The pid thread has already exited
+    if (has_exited == 1) {
+        *status = get_excode(pid);
+        V(lock);
+        return 0;
+    }
+
+    // The pid thread is still running
+    else if (has_exited == 0) {
+        pid_thread = find_thread_by_pid(pid);
+
+        V(lock);
+        // wait is initially set to 0, so the current thread will sleep on this semaphore
+        // and get waken up when pid_thread->wait is increased, which happens on exiting pid thread
+        P(pid_thread->wait);
+        *status = get_excode(pid);
+
+        // delete pid_thread from plist
+        delete_from_plist(pid);
+
+        return 0;
+    }
+
+    // The pid thread is not existed in plist
+    else if (has_exited == -1) {
+        V(lock);
+        return EINVAL;
+    }
+
+    // pid thread does not exists
+    // The traditional Unix error code for "no such process" is ESRCH,
+    // although this code is not defined in the OS/161 base system
+    V(lock);
+    return EINVAL;
+}
+
+int sys__exit(int exitcode){
+    int spl = splhigh();
+
+    set_excode(curthread->pid,exitcode);
+
+
+    thread_exit();
+    splx(spl);
+    return 0;
+}
+
+// Partially based on runprogram() in runprogram.c
+int sys_execv(const char *program, char **args, int* retval) {
+
+    struct vnode *v;
+    vaddr_t entrypoint, stackptr;
+    int check;      // used to check if the function return an error
+    int argc = 0;   // number of arguments in args
+    int i;          // for loops
+
+    // check if the argument program is provided
+    if (program == NULL) return EFAULT;
+    if ((void*)program == (void*)0x40000000) return EFAULT;
+    if ((void*)program == (void*)0x80000000) return EFAULT;
+
+    int program_len = strlen(program);
+    if (program_len == 0) return EINVAL;
+
+    // Allocate space for copying program from use to kernel space
+    // +1 for null character at the end; if null -> not sufficient memory
+    char* program_path = kmalloc(program_len*sizeof(char)+1);
+    if (!program_path) return ENOMEM;
+
+    // Copy program from user to kernel spacel; if not 0 -> not sufficient memory
+    check = copyinstr(program, program_path, program_len+1, NULL);
+    if (check) return ENOMEM;
+
+    if ((void*)args == (void*)0x40000000) return EFAULT;
+    if ((void*)args == (void*)0x80000000) return EFAULT;
+
+    if (args != NULL) {
+        while (args[argc] != NULL) argc++;
+    } else {
+        return EFAULT;
+    }
+
+    char *argv[argc+1]; // copied arguments
+    // Copy the arguments to kernel space
+    for (i = 0; i < argc; i++) {
+        if (args[i] == 0x40000000) return EFAULT;
+        if (args[i] == 0x80000000) return EFAULT;
+        int arg_len = strlen(args[i]);
+
+        argv[i] = (char*)kmalloc(arg_len*sizeof(char)+1);  // +1 for '\0' char ending the string
+        if (!argv[i]) return ENOMEM;
+
+        check = copyinstr(args[i], argv[i], arg_len+1, NULL);
+        if (check) return ENOMEM;
+    }
+    argv[argc] = NULL;
+
+    // Destroy the current address space
+    as_destroy(curthread->t_vmspace);
+
+    // Open the file
+    check = vfs_open(program_path, O_RDONLY, &v);
+    if (check) return check;
+
+    // Create a new address space
+    curthread->t_vmspace = as_create();
+    if (curthread->t_vmspace==NULL) {
+        vfs_close(v);
+        return ENOMEM;
+    }
+
+    // Activate it.
+    as_activate(curthread->t_vmspace);
+
+    // Load the executable
+    check = load_elf(v, &entrypoint);
+    if (check) {
+        // thread_exit destroys curthread->t_vmspace
+        vfs_close(v);
+        return check;
+    }
+
+    // Done with the file now.
+    vfs_close(v);
+
+    // Define the user stack in the address space
+    check = as_define_stack(curthread->t_vmspace, &stackptr);
+    if (check) return check;
+
+    // Arbitrary array storing pointers to values of arguments
+    userptr_t pointers[argc];
+
+    // Load the values of  arguments from kernel to user-space stack
+    for (i=argc-1; i >= 0; i--) {
+    	// The length of the argument is padded to nearest number divisible by 4
+    	// as the stack block is 4-byte long and one character takes one byte
+        int block_len;
+        if ( (strlen(argv[i])+1) % 4 == 0 ) {
+            block_len = strlen(argv[i])+1;
+        } else {
+            block_len = (strlen(argv[i])+1) + (4-((strlen(argv[i])+1)%4));
+        }
+
+        stackptr -= block_len;
+        check = copyoutstr(argv[i], stackptr, strlen(argv[i])+1, NULL);
+        if (check) return check;
+        pointers[i] = stackptr;
+    }
+
+    // Now copy the pointers to values onto the stack
+    for (i=argc-1; i >= 0; i--) {
+      stackptr -= 4;
+      check = copyout(pointers+i, stackptr, 4);
+      if (check) return check;
+    }
+
+    md_usermode(argc,(userptr_t)stackptr, stackptr, entrypoint);
+
+    panic("md_usermode returned\n");
+    return EINVAL;
+
+}
+
+int sys___time(userptr_t user_secs, userptr_t user_nsecs, int *retval){
+    time_t secs;
+    u_int32_t nsecs;
+
+    gettime(&secs,&nsecs);
+
+    int result;
+    if(user_secs != NULL){
+        result = copyout(&secs,user_secs,sizeof(time_t));
+        if(result != 0){
+            *retval = -1;
+            return EFAULT;
+        }
+    }
+    
+    result = copyout(&nsecs,user_nsecs,sizeof(u_int32_t));
+    if(result != 0){
+        *retval = -1;
+        return EFAULT;
+    }
+
+    *retval = (int)secs;
+    return 0;
+}
+
+int sys_sbrk(intptr_t amount, int *retval){
+
+}

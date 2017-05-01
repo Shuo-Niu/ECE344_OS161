@@ -1,0 +1,32 @@
+#include <addrspace.h>
+#include <curthread.h>
+#include <dev.h>
+#include <lib.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <scheduler.h>
+#include <synch.h>
+#include <syscall.h>
+#include <test.h>
+#include <thread.h>
+#include <types.h>
+#include <version.h>
+#include <vfs.h>
+#include <vm.h>
+
+int sys_fork(){
+}
+
+int sys_getpid(){
+}
+
+int sys_waitpid(){
+}
+
+int sys__exit(){
+}
+
+int sys_execv(){
+}
